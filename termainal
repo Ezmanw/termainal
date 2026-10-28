@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""termainal - a fake Linux terminal hallucinated by a local LLM (via Ollama).
+
+Nothing you type is ever executed. Go ahead, sudo rm -rf / --no-preserve-root.
+"""
+
+import json
+import os
+import platform
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+try:
+    import readline  # arrow keys + history for input()
+except ImportError:
+    readline = None
+
+VERSION = "1.1.0"
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "termainal")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+HISTORY_PATH = os.path.join(CONFIG_DIR, "history")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+if not OLLAMA_HOST.startswith("http"):
+    OLLAMA_HOST = "http://" + OLLAMA_HOST
+
+MAX_HISTORY_CHARS = 24000   # rough cap on the conversation sent back when memory is on
+MAX_STORED_OUTPUT = 2500    # long outputs are truncated in that history
+FENCE_RE = re.compile(r"^\s*```[\w-]*\s*$")
+JUNK_RE = re.compile(r"^\s*(\[cwd:[^\]]*\]|<<\s*cwd:[^>]*>*)\s*", re.I)
+
+TTY = sys.stdout.isatty()
+C = {"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "green": "\033[32m",
+     "blue": "\033[34m", "cyan": "\033[36m", "red": "\033[31m", "yellow": "\033[33m"}
+
+
+def c(text, *styles):
+    return "".join(C[s] for s in styles) + text + C["reset"] if TTY else text
+
+
+# --------------------------------------------------------------------------- specs
+
+FAKE_DEFAULTS = {
+    "os": "Pop!_OS 24.04 LTS x86_64",
+    "host": "A520M K -CF",
+    "kernel": "7.2.6-76070206-generic",
+    "packages": "3678 (dpkg), 54 (flatpak), 8 (snap)",
+    "shell": "bash 5.2.21",
+    "resolution": "2560x1440",
+    "de": "COSMIC",
+    "theme": "Breeze [GTK2/3]",
+    "icons": "breeze-dark [GTK2/3]",
+    "terminal": "cosmic-term",
+    "cpu": "AMD Ryzen 5 5500 (12) @ 4.268GHz",
+    "gpu": "NVIDIA GeForce RTX 3060 Lite Hash Rate",
+    "memory_mib": "15857",
+}
+SPEC_LABELS = [("os", "OS"), ("host", "Host"), ("kernel", "Kernel"), ("packages", "Packages"),
+               ("shell", "Shell"), ("resolution", "Resolution"), ("de", "DE"), ("theme", "Theme"),
+               ("icons", "Icons"), ("terminal", "Terminal"), ("cpu", "CPU"), ("gpu", "GPU"),
+               ("memory_mib", "Total RAM (MiB)")]
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _cmd(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def real_specs():
+    """Best-effort neofetch-style facts about the machine termainal is running on."""
+    s = {}
+    osr = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', _read("/etc/os-release"), re.M))
+    s["os"] = f"{osr.get('PRETTY_NAME', platform.system())} {platform.machine()}"
+    s["host"] = _read("/sys/devices/virtual/dmi/id/product_name")
+    if not s["host"] or "to be filled" in s["host"].lower():
+        s["host"] = _read("/sys/devices/virtual/dmi/id/board_name")
+    s["kernel"] = platform.release()
+
+    pk = []
+    dpkg = _read("/var/lib/dpkg/status").count("Status: install ok installed")
+    if dpkg:
+        pk.append(f"{dpkg} (dpkg)")
+    for tool, args in (("rpm", ("rpm", "-qa")), ("pacman", ("pacman", "-Qq")),
+                       ("flatpak", ("flatpak", "list", "--app")), ("snap", ("snap", "list"))):
+        if shutil.which(tool):
+            n = len(_cmd(*args).splitlines()) - (1 if tool == "snap" else 0)
+            if n > 0:
+                pk.append(f"{n} ({tool})")
+    s["packages"] = ", ".join(pk)
+
+    shell = os.path.basename(os.environ.get("SHELL", "bash"))
+    ver = re.search(r"\d+\.\d+(\.\d+)?", _cmd(shell, "--version"))
+    s["shell"] = f"{shell} {ver.group(0)}" if ver else shell
+
+    res = re.search(r"current (\d+) x (\d+)", _cmd("xrandr", "--current")) if shutil.which("xrandr") else None
+    s["resolution"] = f"{res.group(1)}x{res.group(2)}" if res else ""
+    s["de"] = os.environ.get("XDG_CURRENT_DESKTOP", "").replace("pop:", "")
+    s["terminal"] = os.environ.get("TERM_PROGRAM") or _terminal_name()
+
+    cpuinfo = _read("/proc/cpuinfo")
+    model = re.search(r"model name\s*:\s*(.*)", cpuinfo)
+    cores = os.cpu_count() or 1
+    khz = _read("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    cpu = re.sub(r"\s+\d+-Core Processor|\(R\)|\(TM\)| CPU", "", model.group(1)).strip() if model else platform.processor()
+    s["cpu"] = f"{cpu} ({cores})" + (f" @ {int(khz) / 1e6:.3f}GHz" if khz.isdigit() else "")
+
+    gpus = []
+    for line in _cmd("lspci").splitlines():
+        if re.search(r"VGA|3D controller|Display controller", line):
+            name = line.split(": ", 1)[-1]
+            bracket = re.findall(r"\[([^\]]+)\]", name)
+            vendor = name.split()[0]
+            gpus.append(f"{vendor} {bracket[-1]}" if bracket else name)
+    s["gpu"] = " / ".join(gpus)
+
+    mem = re.search(r"MemTotal:\s*(\d+)", _read("/proc/meminfo"))
+    s["memory_mib"] = str(int(mem.group(1)) // 1024) if mem else "16000"
+    return {k: v for k, v in s.items() if v}
+
+
+def _terminal_name():
+    try:  # termainal -> shell -> terminal emulator
+        pid = os.getppid()
+        for _ in range(2):
+            pid = int(_read(f"/proc/{pid}/stat").rsplit(")", 1)[1].split()[1])
+        return _read(f"/proc/{pid}/comm")
+    except (ValueError, IndexError):
+        return ""
+
+
+def specs_for(cfg):
+    if cfg.get("specs_mode") == "real":
+        return real_specs()
+    return {**FAKE_DEFAULTS, **cfg.get("fake_specs", {})}
+
+
+# --------------------------------------------------------------------------- config
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def ollama_models():
+    with urllib.request.urlopen(OLLAMA_HOST + "/api/tags", timeout=5) as r:
+        return sorted(m["name"] for m in json.load(r).get("models", []))
+
+
+def ask(question, default=None):
+    suffix = f" [{default}]" if default else ""
+    while True:
+        try:
+            ans = input(c(question, "bold") + suffix + " ").strip()
+        except EOFError:
+            print()
+            sys.exit(0)
+        if ans:
+            return ans
+        if default is not None:
+            return default
+
+
+def ask_yes(question, default):
+    ans = ask(question + (" (Y/n)" if default else " (y/N)"), "").lower()
+    return default if not ans else ans.startswith("y")
+
+
+def setup(cfg=None):
+    cfg = dict(cfg or {})
+    print(c("\n termainal setup", "bold", "cyan"), c(f"v{VERSION}", "dim"))
+    print(c(" A fake terminal powered by a local model. Nothing you type is really run.\n", "dim"))
+
+    try:
+        models = ollama_models()
+    except (urllib.error.URLError, OSError):
+        print(c(f"Can't reach Ollama at {OLLAMA_HOST}.", "red"))
+        print("Install it from https://ollama.com and make sure it's running (`ollama serve`).")
+        sys.exit(1)
+    if not models:
+        print(c("Ollama has no models installed.", "red"))
+        print("Grab one first, e.g.:  ollama pull qwen2.5:3b")
+        sys.exit(1)
+
+    for i, name in enumerate(models, 1):
+        mark = c("  (current)", "dim") if name == cfg.get("model") else ""
+        print(f"  {c(str(i), 'cyan')}) {name}{mark}")
+    default_idx = str(models.index(cfg["model"]) + 1) if cfg.get("model") in models else "1"
+    while True:
+        pick = ask("which model do you want to use?", default_idx)
+        if pick.isdigit() and 1 <= int(pick) <= len(models):
+            cfg["model"] = models[int(pick) - 1]
+            break
+        if pick in models:
+            cfg["model"] = pick
+            break
+        print(c("  pick a number from the list", "yellow"))
+
+    cfg["hostname"] = re.sub(r"\s+", "-", ask("machine name?", cfg.get("hostname", "termainal")))
+    cfg["username"] = re.sub(r"\s+", "-", ask("username?", cfg.get("username") or os.environ.get("USER", "user")))
+
+    print(c("\n  1) real   - use this PC's actual specs (read locally, only sent to Ollama)", "dim"))
+    print(c("  2) fake   - make up your own", "dim"))
+    mode = ask("which specs should the fake machine have?", "2" if cfg.get("specs_mode") == "fake" else "1")
+    cfg["specs_mode"] = "fake" if mode.strip().lower() in ("2", "fake", "f") else "real"
+    if cfg["specs_mode"] == "fake":
+        current = {**FAKE_DEFAULTS, **cfg.get("fake_specs", {})}
+        print(c("  press enter to keep each value", "dim"))
+        cfg["fake_specs"] = {k: ask(f"  {label}:", current[k]) for k, label in SPEC_LABELS}
+
+    print(c("\n  With memory on, the model sees the whole session, so files you make stick around.", "dim"))
+    print(c("  It's slower and small models get confused on long sessions.", "dim"))
+    cfg["memory"] = ask_yes("remember session history?", cfg.get("memory", False))
+
+    save_config(cfg)
+    print(c(f"\nSaved to {CONFIG_PATH}. Type 'config' to change, 'reset' to wipe the machine, 'exit' to quit.\n", "dim"))
+    return cfg
+
+
+# --------------------------------------------------------------------------- neofetch
+
+POP_LOGO = r"""             /////////////
+         /////////////////////
+      ///////*767////////////////
+    //////7676767676*//////////////
+   /////76767//7676767//////////////
+  /////767676///*76767///////////////
+ ///////767676///76767.///7676*///////
+/////////767676//76767///767676////////
+//////////76767676767////76767/////////
+///////////76767676//////7676//////////
+////////////,7676,///////767///////////
+/////////////*7676///////76////////////
+///////////////7676////////////////////
+ ///////////////7676///767////////////
+  //////////////////////'////////////
+   //////.7676767676767676767,//////
+    /////767676767676767676767/////
+      ///////////////////////////
+         /////////////////////
+             /////////////""".split("\n")
+
+TUX_LOGO = r"""        .--.
+       |o_o |
+       |:_/ |
+      //   \ \
+     (|     | )
+    /'\_   _/`\
+    \___)=(___/""".split("\n")
+
+
+def neofetch(cfg, specs, started):
+    mins = int((time.time() - started) / 60) + 65
+    hours = mins // 60
+    uptime = f"{hours} hour{'s' if hours != 1 else ''}, {mins % 60} mins"
+    total = int(specs.get("memory_mib", "16000") or 16000)
+    used = random.randint(int(total * 0.25), int(total * 0.5))
+    user_host = f"{cfg['username']}@{cfg['hostname']}"
+    fields = [("OS", "os"), ("Host", "host"), ("Kernel", "kernel"), ("Uptime", None),
+              ("Packages", "packages"), ("Shell", "shell"), ("Resolution", "resolution"), ("DE", "de"),
+              ("Theme", "theme"), ("Icons", "icons"), ("Terminal", "terminal"), ("CPU", "cpu"),
+              ("GPU", "gpu"), ("Memory", None)]
+    info = [(None, user_host), (None, "-" * len(user_host))]
+    for label, key in fields:
+        val = uptime if label == "Uptime" else f"{used}MiB / {total}MiB" if label == "Memory" else specs.get(key)
+        if val:
+            info.append((label, val))
+
+    logo = POP_LOGO if "pop" in specs.get("os", "").lower() else TUX_LOGO
+    width = max(len(l) for l in logo) + 3
+    plain, pretty = [], []
+    for i in range(max(len(logo), len(info))):
+        art = logo[i] if i < len(logo) else ""
+        lp, pp = art.ljust(width), color_logo(art) + " " * (width - len(art))
+        if i < len(info):
+            key, val = info[i]
+            lp += val if key is None else f"{key}: {val}"
+            pp += (c(val, "bold", "cyan") if "@" in val else val) if key is None else c(key, "bold", "cyan") + f": {val}"
+        plain.append(lp.rstrip())
+        pretty.append(pp.rstrip())
+    return "\n".join(plain), "\n".join(pretty)
+
+
+def color_logo(line):
+    if not TTY:
+        return line
+    return "".join(c(ch, "cyan") if ch == "/" else c(ch, "bold") if ch != " " else ch for ch in line)
+
+
+# --------------------------------------------------------------------------- the fake machine
+
+def system_prompt(cfg, specs, cwd, memory):
+    u, h = cfg["username"], cfg["hostname"]
+    spec_lines = "\n".join(f"- {label}: {specs[k]}" for k, label in SPEC_LABELS if specs.get(k))
+    continuity = (
+        "Stay consistent with everything earlier in this session: files created stay created, deleted things stay "
+        "deleted, installed packages stay installed, env vars persist."
+        if memory else
+        "You only see this one command. Invent plausible, realistic contents for files and directories."
+    )
+    return f"""You are a simulated Linux computer. The user types ONE command into a bash shell and you reply with EXACTLY what the terminal prints for that command, then stop.
+
+Machine:
+- hostname: {h}, user: {u} (uid 1000, in the sudo group, sudo needs no password), home: /home/{u}
+{spec_lines}
+- apt, python3, git, gcc, curl, vim, nano are installed. Internet works.
+- Home has the usual folders: Desktop Documents Downloads Music Pictures Public Templates Videos, plus some realistic files.
+- Current working directory: {cwd}
+
+Rules:
+1. Output ONLY the raw terminal output of the single command. No explanations, no markdown, no code fences, never mention being an AI.
+2. NEVER write a prompt, the next command, or anything the user would type. Stop as soon as the command's output ends.
+3. Commands with no output (cd, mkdir, touch, rm, export, redirects to files...) produce no text at all. Reply with nothing.
+4. {continuity}
+5. Destructive commands really "happen" in the simulation, with realistic consequences.
+6. Errors look exactly like real bash/coreutils errors.
+7. Interactive programs (vim, top, nano, python REPL...) show one plausible snapshot, then assume they were exited.
+"""
+
+
+WIPE_RE = re.compile(r"\brm\s+(-\S+\s+)*-\S*[rR]\S*\s+(-\S+\s+)*/\*?(\s|$)")
+
+# what real coreutils prints while it eats the system: only the pseudo-filesystems survive
+WIPE_OUTPUT = """rm: cannot remove '/proc/1/fd/0': Operation not permitted
+rm: cannot remove '/proc/1/task/1/fd/0': Operation not permitted
+rm: cannot remove '/proc/sys/kernel/hostname': Operation not permitted
+rm: cannot remove '/sys/firmware/efi/efivars': Operation not permitted
+rm: cannot remove '/sys/kernel/security': Device or resource busy
+rm: cannot remove '/dev/pts/0': Operation not permitted
+rm: cannot remove '/run/user/1000/gvfs': Device or resource busy"""
+
+WRECKED_NOTE = """
+IMPORTANT: the filesystem was wiped with rm -rf / as root. /bin, /usr, /etc, /home, /lib are GONE. Only bash builtins work; everything else is missing.
+"""
+
+BUILTINS = set("""cd echo pwd printf type help export unset alias unalias read set shopt history kill
+exit logout source . true false test [ [[ jobs fg bg let declare local typeset umask ulimit times
+trap wait hash eval exec command builtin enable dirs pushd popd disown suspend caller compgen
+complete getopts mapfile readarray return shift break continue :""".split())
+
+SURVIVORS = ("/", "/proc", "/sys", "/dev", "/run")
+
+
+def is_wreck_command(command, cfg):
+    root = command.lstrip().startswith(("sudo ", "doas ")) or cfg["username"] == "root"
+    return root and bool(WIPE_RE.search(command))
+
+
+def resolve(cwd, target, user):
+    home = f"/home/{user}"
+    if not target or target == "~":
+        return home
+    if target.startswith("~/"):
+        target = home + target[1:]
+    return os.path.normpath(os.path.join(cwd, target))
+
+
+def last_cd_target(command):
+    """`mkdir x && cd x` -> 'x'. None if the command never cds."""
+    target = None
+    for part in re.split(r"&&|;|\|\|", command):
+        words = part.split()
+        if words and words[0] == "cd":
+            target = words[1] if len(words) > 1 else "~"
+    return target
+
+
+# --------------------------------------------------------------------------- session
+
+class Session:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.reset()
+
+    def reset(self):
+        self.specs = specs_for(self.cfg)
+        self.history = []  # only used when memory is on
+        self.cwd = f"/home/{self.cfg['username']}"
+        self.started = time.time()
+        self.wrecked = False
+        self.use_think_flag = True
+
+    def prompt(self):
+        home = f"/home/{self.cfg['username']}"
+        path = "~" + self.cwd[len(home):] if self.cwd == home or self.cwd.startswith(home + "/") else self.cwd
+        if not TTY:
+            return f"{self.cfg['username']}@{self.cfg['hostname']}:{path}$ "
+        # \001 / \002 tell readline the colour codes take no width
+        return (f"\001\033[1;32m\002{self.cfg['username']}@{self.cfg['hostname']}\001\033[0m\002:"
+                f"\001\033[1;34m\002{path}\001\033[0m\002$ ")
+
+    def record(self, command, output):
+        if not self.cfg.get("memory"):
+            return
+        if len(output) > MAX_STORED_OUTPUT:
+            output = output[:MAX_STORED_OUTPUT] + "\n[...]"
+        self.history.append({"role": "user", "content": command})
+        self.history.append({"role": "assistant", "content": output})
+
+    def trimmed_history(self):
+        total, keep = 0, []
+        for msg in reversed(self.history):
+            total += len(msg["content"])
+            if total > MAX_HISTORY_CHARS and keep:
+                break
+            keep.append(msg)
+        keep.reverse()
+        if keep and keep[0]["role"] == "assistant":
+            keep = keep[1:]
+        return keep
+
+    def handle(self, cmd):
+        """Run one command: local fast paths first, then the model."""
+        word = cmd.split()[0]
+        if cmd == "pwd":
+            return self.say(cmd, self.cwd)
+        if self.wrecked:
+            return self.handle_wrecked(cmd, word)
+        if word == "neofetch":
+            plain, pretty = neofetch(self.cfg, self.specs, self.started)
+            print(pretty)
+            self.record(cmd, plain)
+            return
+
+        if is_wreck_command(cmd, self.cfg):
+            self.wrecked = True
+            self.cwd = "/"
+            return self.say(cmd, WIPE_OUTPUT)
+
+        cd_target = last_cd_target(cmd)
+        output = self.ask_model(cmd, quiet=cd_target is not None)
+
+        if cd_target is not None:
+            new_cwd = resolve(self.cwd, cd_target, self.cfg["username"])
+            # small models love to echo the new path after cd; real bash prints nothing
+            lines = [l for l in output.split("\n") if l.strip() and l.strip() not in (new_cwd, cd_target)]
+            output = "\n".join(lines)
+            if output:
+                print(output)
+            if not re.search(r"cd: .*(No such file|Not a directory|Permission denied)", output):
+                self.cwd = new_cwd
+        self.record(cmd, output)
+
+    def handle_wrecked(self, cmd, word):
+        """After rm -rf /, anything that isn't a bash builtin simply doesn't exist any more."""
+        if word == "cd":
+            parts = cmd.split()
+            target = parts[1] if len(parts) > 1 else "~"
+            path = resolve(self.cwd, target, self.cfg["username"])
+            if path in SURVIVORS or path.startswith(tuple(p + "/" for p in SURVIVORS[1:])):
+                self.cwd = path
+                return self.record(cmd, "")
+            return self.say(cmd, f"bash: cd: {target}: No such file or directory")
+        if word in BUILTINS or ("=" in word and not word.startswith("=")):
+            output = self.ask_model(cmd)
+            return self.record(cmd, output)
+        if "/" in word:
+            return self.say(cmd, f"bash: {word}: No such file or directory")
+        return self.say(cmd, f"bash: {word}: command not found")
+
+    def say(self, cmd, text):
+        print(text)
+        self.record(cmd, text)
+
+    # ----------------------------------------------------------------------- model I/O
+
+    def ask_model(self, command, quiet=False):
+        sysmsg = system_prompt(self.cfg, self.specs, self.cwd, self.cfg.get("memory"))
+        if self.wrecked:
+            sysmsg += WRECKED_NOTE
+        messages = [{"role": "system", "content": sysmsg}]
+        if self.cfg.get("memory"):
+            messages += self.trimmed_history()
+        messages.append({"role": "user", "content": command})
+
+        u, h = self.cfg["username"], self.cfg["hostname"]
+        body = {
+            "model": self.cfg["model"],
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": 0.4, "num_ctx": 8192, "num_predict": 1500, "repeat_penalty": 1.15,
+                # stop the model from inventing the next prompt / command
+                "stop": [f"{u}@{h}:", "[cwd", "[CWD", "<<CWD", "<<cwd", "\n$ "],
+            },
+        }
+        if self.use_think_flag:
+            body["think"] = False
+
+        printer = StreamPrinter(command, quiet=quiet)
+        try:
+            for chunk in self.stream(body):
+                printer.feed(chunk)
+        except KeyboardInterrupt:
+            printer.finish()
+            print("^C")
+            return printer.output()
+        except (urllib.error.URLError, OSError) as e:
+            print(c(f"termainal: lost connection to Ollama ({e})", "red"))
+        printer.finish()
+        return printer.output()
+
+    def stream(self, body):
+        req = urllib.request.Request(
+            OLLAMA_HOST + "/api/chat", data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=300)
+        except urllib.error.HTTPError as e:
+            # older Ollama / some models reject the "think" field: retry without it
+            if e.code == 400 and "think" in body:
+                self.use_think_flag = False
+                yield from self.stream({k: v for k, v in body.items() if k != "think"})
+                return
+            raise
+        with resp:
+            for line in resp:
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                if data.get("error"):
+                    raise OSError(data["error"])
+                yield data.get("message", {}).get("content", "")
+                if data.get("done"):
+                    break
+
+
+class StreamPrinter:
+    """Prints model output line by line, hiding <think> blocks, code fences and stray markers."""
+
+    def __init__(self, command, quiet=False):
+        self.echoes = {"$", command.strip(), "$ " + command.strip()}  # models sometimes echo the command back
+        self.quiet = quiet
+        self.buf = ""
+        self.lines = []
+        self.in_think = False
+
+    def feed(self, text):
+        self.buf += text
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            self.emit(line)
+
+    def finish(self):
+        if self.buf:
+            self.emit(self.buf)
+            self.buf = ""
+
+    def emit(self, line):
+        if "<think>" in line:
+            self.in_think = True
+        if self.in_think:
+            if "</think>" not in line:
+                return
+            self.in_think = False
+            line = line.split("</think>", 1)[1]
+        if JUNK_RE.match(line):
+            line = JUNK_RE.sub("", line)
+            if not line.strip():
+                return
+        if FENCE_RE.match(line) or line.strip() in self.echoes or (not self.lines and not line.strip()):
+            return
+        self.lines.append(line)
+        if not self.quiet:
+            print(line, flush=True)
+
+    def output(self):
+        while self.lines and not self.lines[-1].strip():
+            self.lines.pop()
+        return "\n".join(self.lines)
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        print("\nBuilt-ins: exit, config, reset, clear.  Config lives in", CONFIG_PATH)
+        return
+    if len(sys.argv) > 1 and sys.argv[1] in ("-v", "--version"):
+        print("termainal", VERSION)
+        return
+
+    cfg = load_config()
+    if not cfg or not all(k in cfg for k in ("model", "hostname", "username", "specs_mode")):
+        cfg = setup(cfg)
+
+    if readline:
+        try:
+            readline.read_history_file(HISTORY_PATH)
+        except OSError:
+            pass
+        readline.set_history_length(1000)
+
+    session = Session(cfg)
+    mem = "on" if cfg.get("memory") else "off"
+    print(c(f"termainal: {cfg['model']} is pretending to be {cfg['hostname']} "
+            f"({cfg['specs_mode']} specs, memory {mem}). Nothing here is real.", "dim"))
+    print(c("built-ins: exit, config, reset, clear\n", "dim"))
+
+    try:
+        while True:
+            try:
+                command = input(session.prompt())
+            except KeyboardInterrupt:
+                print("^C")
+                continue
+            except EOFError:
+                print("exit")
+                break
+
+            cmd = command.strip()
+            if not cmd:
+                continue
+            if cmd in ("exit", "logout") or cmd.startswith("exit "):
+                break
+            if cmd == "config":
+                session.cfg = cfg = setup(cfg)
+                session.reset()
+                continue
+            if cmd == "reset":
+                session.reset()
+                print(c("machine restored to factory state.", "dim"))
+                continue
+            if cmd == "clear":
+                print("\033[H\033[2J", end="", flush=True)
+                continue
+            session.handle(cmd)
+    finally:
+        if readline:
+            try:
+                os.makedirs(CONFIG_DIR, exist_ok=True)
+                readline.write_history_file(HISTORY_PATH)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()
